@@ -360,6 +360,54 @@ async def test_dont_dispatch_cancelled():
 
 
 @pytest.mark.asyncio
+async def test_handles_cancelling_pending_dispatch_tasks():
+    session_closed = False
+    session_used_after_close = False
+
+    async def db_load(ids: List[int]) -> Optional[List[int]]:
+        nonlocal session_used_after_close
+        await asyncio.sleep(0.1)
+        if session_closed:
+            session_used_after_close = True
+            raise RuntimeError("session used after close")
+        return ids
+
+    user_loader = DataLoader(load_fn=db_load)
+
+    async def load_user_or_raise(idx) -> int:
+        return await user_loader.load(idx)
+
+    async def load_post_or_raise(ids: List[int]) -> Optional[List[int]]:
+        await asyncio.sleep(0.01)
+        raise ValueError("post not found")
+
+    task_1 = asyncio.create_task(load_user_or_raise(1))
+    task_2 = asyncio.create_task(load_post_or_raise(2))
+
+    # gather will raise error from task_2
+    with pytest.raises(ValueError):
+        await asyncio.gather(task_1, task_2)
+
+    # task_2 is done because it raised an error
+    assert task_2.done()
+
+    # task_1 is not done: gather doesn't cancel tasks in case of an exception
+    assert not task_1.done()
+    # cancel task_1, like it would have been when used with TaskGroup
+    task_1.cancel()
+
+    # It should be fine to close the session now, no more tasks should be running
+    session_closed = True
+
+    assert task_1.cancelled
+    assert not session_used_after_close
+
+    # Wait for a bit longer than the load_fn to make sure the session is not used
+    await asyncio.sleep(0.2)
+    assert not session_used_after_close
+
+
+@pytest.mark.asyncio
 async def test_cache_override():
     class TestCache(AbstractCache[int, int]):
         def __init__(self):
