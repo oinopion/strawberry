@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 from abc import ABC, abstractmethod
-from asyncio import create_task, gather, get_event_loop
+from asyncio import Task, create_task, gather, get_event_loop
 from asyncio.futures import Future
 from dataclasses import dataclass
 from typing import (
@@ -43,10 +43,20 @@ class LoaderTask(Generic[K, T]):
 class Batch(Generic[K, T]):
     tasks: List[LoaderTask] = dataclasses.field(default_factory=list)
     dispatched: bool = False
+    canceled: bool = False
 
     def add_task(self, key: Any, future: Future) -> None:
         task = LoaderTask[K, T](key, future)
         self.tasks.append(task)
+
+    def cancel(self) -> None:
+        if self.canceled:
+            return
+
+        self.canceled = True
+        for task in self.tasks:
+            if not task.future.done():
+                task.future.cancel()
 
     def __len__(self) -> int:
         return len(self.tasks)
@@ -91,6 +101,7 @@ class DefaultCache(AbstractCache[K, T]):
 
 
 class DataLoader(Generic[K, T]):
+    closed: bool = False
     batch: Optional[Batch[K, T]] = None
     cache: bool = False
     cache_map: AbstractCache[K, T]
@@ -133,6 +144,11 @@ class DataLoader(Generic[K, T]):
 
         self._loop = loop
 
+        # To handle all cancellation edge cases, we need to keep track of batches scheduled
+        # for dispatch and also batches & tasks that have been dispatched
+        self._scheduled_batches: List[Batch] = []
+        self._dispatch_tasks_and_batches: Dict[Task, Batch] = {}
+
         self.cache = cache
 
         if self.cache:
@@ -148,6 +164,11 @@ class DataLoader(Generic[K, T]):
         return self._loop
 
     def load(self, key: K) -> Awaitable[T]:
+        if self.closed:
+            future = self.loop.create_future()
+            future.cancel()
+            return future
+
         if self.cache:
             future = self.cache_map.get(key)
 
@@ -206,35 +227,68 @@ class DataLoader(Generic[K, T]):
                     task for task in self.batch.tasks if not task.future.done()
                 ]
 
+    @property
+    def current_batch(self) -> Batch:
+        if self.batch and not should_create_new_batch(self, self.batch):
+            return self.batch
+
+        self.batch = Batch()
+
+        dispatch(self, self.batch)
+
+        return self.batch
+
+    def schedule_batch_dispatch(self, batch: Batch) -> None:
+        # We need to run the load_fn as late as possible to batch as many keys as possible.
+        # Using call_soon puts the function call at the end of the event loop queue.
+        # Additionally, to handle task cancellation we'll we need to keep track of batches that
+        # have been scheduled but not yet dispatched.
+        self._scheduled_batches.append(batch)
+        self.loop.call_soon(self._create_dispatch_task, batch)
+
+    def _create_dispatch_task(self, batch: Batch) -> None:
+        self._scheduled_batches.remove(batch)
+        dispatch_task = create_task(dispatch_batch(self, batch))
+        self._dispatch_tasks_and_batches[dispatch_task] = batch
+        dispatch_task.add_done_callback(self._on_dispatch_task_done)
+
+    def _on_dispatch_task_done(self, task: Task) -> None:
+        batch: Batch = self._dispatch_tasks_and_batches.pop(task, None)
+        if task.cancelled() and batch is not None:
+            batch.cancel()
+
+    def cancel_pending_tasks(self) -> None:
+        self.closed = True
+        for batch in self._scheduled_batches:
+            batch.cancel()
+        for task, batch in self._dispatch_tasks_and_batches.items():
+            if not task.done():
+                task.cancel()
+            batch.cancel()
+
 
 def should_create_new_batch(loader: DataLoader, batch: Batch) -> bool:
-    if (
-        batch.dispatched
-        or loader.max_batch_size
-        and len(batch) >= loader.max_batch_size
-    ):
+    if batch.dispatched or batch.canceled:
         return True
+
+    if loader.max_batch_size:
+        return len(batch) >= loader.max_batch_size
 
     return False
 
 
 def get_current_batch(loader: DataLoader) -> Batch:
-    if loader.batch and not should_create_new_batch(loader, loader.batch):
-        return loader.batch
-
-    loader.batch = Batch()
-
-    dispatch(loader, loader.batch)
-
-    return loader.batch
+    return loader.current_batch
 
 
 def dispatch(loader: DataLoader, batch: Batch) -> None:
-    loader.loop.call_soon(create_task, dispatch_batch(loader, batch))
+    loader.schedule_batch_dispatch(batch)
 
 
 async def dispatch_batch(loader: DataLoader, batch: Batch) -> None:
     batch.dispatched = True
+    if batch.canceled:
+        return
 
     keys = [task.key for task in batch.tasks]
     if len(keys) == 0:
@@ -248,16 +302,15 @@ async def dispatch_batch(loader: DataLoader, batch: Batch) -> None:
     try:
         values = await loader.load_fn(keys)
         values = list(values)
-
         if len(values) != len(batch):
             raise WrongNumberOfResultsReturned(
                 expected=len(batch), received=len(values)
             )
 
         for task, value in zip(batch.tasks, values):
-            # Trying to set_result in a cancelled future would raise
+            # Trying to set_result in a done future (cancelled or otherwise) would raise
             # asyncio.exceptions.InvalidStateError
-            if task.future.cancelled():
+            if task.future.done():
                 continue
 
             if isinstance(value, BaseException):
@@ -266,6 +319,8 @@ async def dispatch_batch(loader: DataLoader, batch: Batch) -> None:
                 task.future.set_result(value)
     except Exception as e:
         for task in batch.tasks:
+            if task.future.done():
+                continue
             task.future.set_exception(e)
 
 

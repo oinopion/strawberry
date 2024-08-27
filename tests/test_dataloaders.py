@@ -104,6 +104,8 @@ async def test_when_raising_error_in_loader():
     with pytest.raises(ValueError):
         await loader.load(1)
 
+    a = loader.load(1)
+    a.cancel()
     with pytest.raises(ValueError):
         await asyncio.gather(
             loader.load(1),
@@ -357,6 +359,183 @@ async def test_dont_dispatch_cancelled():
     assert value_b == 2
     assert value_c == 3
     assert value_d == 4
+
+
+@pytest.mark.asyncio
+async def test_handles_cancelling_pending_dispatch_tasks():
+    session_closed = False
+    session_used_after_close = False
+
+    async def db_load(ids: List[int]) -> Optional[List[int]]:
+        nonlocal session_used_after_close
+        await asyncio.sleep(0.1)
+        if session_closed:
+            session_used_after_close = True
+            raise RuntimeError("session used after close")
+        return ids
+
+    user_loader = DataLoader(load_fn=db_load)
+
+    async def load_user_or_raise(idx) -> int:
+        return await user_loader.load(idx)
+
+    async def load_post_or_raise(ids: List[int]) -> Optional[List[int]]:
+        await asyncio.sleep(0.01)
+        raise ValueError("post not found")
+
+    task_1 = asyncio.create_task(load_user_or_raise(1))
+    task_2 = asyncio.create_task(load_post_or_raise(2))
+
+    # gather will raise error from task_2
+    with pytest.raises(ValueError):
+        await asyncio.gather(task_1, task_2)
+
+    # task_2 is done because it raised an error
+    assert task_2.done()
+
+    # task_1 is not done: gather doesn't cancel tasks in case of an exception
+    assert not task_1.done()
+    # cancel task_1, like it would have been when used with TaskGroup
+    task_1.cancel()
+
+    user_loader.cancel_pending_tasks()
+
+    # It should be fine to close the session now, no more tasks should be running
+    session_closed = True
+
+    assert task_1.cancelled
+    assert not session_used_after_close
+
+    # Wait for a bit longer than the load_fn to make sure the session is not used
+    await asyncio.sleep(0.2)
+    assert not session_used_after_close
+    assert len(user_loader._dispatch_tasks_and_batches) == 0
+    assert len(user_loader._scheduled_batches) == 0
+
+
+@pytest.mark.asyncio
+async def test_cancelling_dataloader_before_dispatch_task():
+    has_loader_run = False
+
+    async def db_load(ids: List[int]) -> Optional[List[int]]:
+        nonlocal has_loader_run
+        has_loader_run = True
+        await asyncio.sleep(0.1)
+        return ids
+
+    dataloader = DataLoader(load_fn=db_load)
+    future_1 = dataloader.load(1)
+    future_2 = dataloader.load(2)
+
+    # Cancel dataloader tasks before there was a chance to dispatch the first batch
+    dataloader.cancel_pending_tasks()
+
+    assert future_1.cancelled()
+    assert future_2.cancelled()
+
+    # Wait for a bit longer than the load_fn to make sure it's not running
+    await asyncio.sleep(0.11)
+    assert not has_loader_run
+
+    # Check that cleanup was done correctly
+    assert len(dataloader._scheduled_batches) == 0
+    assert len(dataloader._dispatch_tasks_and_batches) == 0
+
+
+@pytest.mark.asyncio
+async def test_cancelling_dataloader_after_dispatch_task_but_before_dispatch():
+    has_loader_run = False
+
+    async def db_load(ids: List[int]) -> Optional[List[int]]:
+        nonlocal has_loader_run
+        has_loader_run = True
+        await asyncio.sleep(0.1)
+        return ids
+
+    dataloader = DataLoader(load_fn=db_load)
+    future_1 = dataloader.load(1)
+    future_2 = dataloader.load(2)
+
+    # Wait for the first batch task to be created, but not yet dispatched
+    await asyncio.sleep(0)
+    assert len(dataloader._scheduled_batches) == 0
+    assert len(dataloader._dispatch_tasks_and_batches) == 1
+    assert not dataloader.batch.dispatched
+
+    dataloader.cancel_pending_tasks()
+
+    assert future_1.cancelled()
+    assert future_2.cancelled()
+
+    # Wait for a bit longer than the load_fn to make sure it's not running
+    await asyncio.sleep(0.11)
+
+    # Check that cleanup was done correctly
+    assert not has_loader_run
+    assert len(dataloader._scheduled_batches) == 0
+    assert len(dataloader._dispatch_tasks_and_batches) == 0
+
+
+@pytest.mark.asyncio
+async def test_handling_canceled_load_fn():
+    loop = asyncio.get_event_loop()
+    load_future = loop.create_future()
+
+    async def db_load(ids: List[int]) -> Optional[List[int]]:
+        await load_future
+        return ids
+
+    dataloader = DataLoader(load_fn=db_load)
+    future_1 = dataloader.load(1)
+    future_2 = dataloader.load(2)
+
+    load_future.cancel()
+
+    await asyncio.sleep(0.01)
+
+    assert future_1.cancelled()
+    assert future_2.cancelled()
+
+    # Check that cleanup was done correctly
+    assert len(dataloader._scheduled_batches) == 0
+    assert len(dataloader._dispatch_tasks_and_batches) == 0
+
+
+@pytest.mark.asyncio
+async def test_load_after_cancel():
+    session_closed = False
+    session_used_after_close = False
+
+    async def db_load(ids: List[int]) -> Optional[List[int]]:
+        nonlocal session_used_after_close
+        await asyncio.sleep(0.01)
+        if session_closed:
+            session_used_after_close = True
+            raise RuntimeError("session used after close")
+        return ids
+
+    dataloader = DataLoader(load_fn=db_load)
+
+    async def complex_action():
+        await asyncio.sleep(0.01)
+        await dataloader.load(2)
+
+    future_1 = dataloader.load(1)
+    future_2 = asyncio.create_task(complex_action())
+
+    dataloader.cancel_pending_tasks()
+    session_closed = True
+
+    assert future_1.cancelled()
+
+    await asyncio.sleep(0.2)
+    assert future_2.done()
+    assert not session_used_after_close
+
+    await asyncio.sleep(0.1)
+    # Check that cleanup was done correctly
+    assert len(dataloader._scheduled_batches) == 0
+    assert len(dataloader._dispatch_tasks_and_batches) == 0
 
 
 @pytest.mark.asyncio
